@@ -437,17 +437,7 @@ Built as a personal embedded-systems and programming project using:
 
 # License
 
-Choose a license before publishing the repository publicly.
-
-For example:
-
--   **MIT License** --- permissive and simple
--   **GPL-3.0** --- requires derivative projects to remain under GPL
--   **All Rights Reserved** --- if you do not want others reusing the
-    code/assets
-
-If the pixel art is original, you should also specify whether other
-users are allowed to copy or modify the sprites.
+-   **N/A**
 
 ------------------------------------------------------------------------
 
