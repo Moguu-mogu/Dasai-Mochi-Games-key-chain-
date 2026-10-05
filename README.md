@@ -429,7 +429,7 @@ Built as a personal embedded-systems and programming project using:
 -   C/C++ game logic
 
 note: This code support by AI and code from different programmer such as the
-Dasai-Mochi concept except games. This project is for personal uses only :).
+Dasai-Mochi concept except games. This project is for personal use and educational purposes only :).
 ------------------------------------------------------------------------
 
 # License
