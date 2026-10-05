@@ -1,4 +1,4 @@
-# Dasai-Mochi ESP32-S3
+# Dasai-Mochi + Game Console ESP32-S3
 
 A small **Dasai-Mochi-inspired desktop game console** built around an
 **ESP32-S3 SuperMini**, a 1.3-inch SH1106 OLED, physical buttons, a
