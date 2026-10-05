@@ -548,6 +548,11 @@ void updateMochi() {
 #define SP_MAX_POWERUPS 3
 #define SP_MAX_EXPLOSIONS 6
 #define SP_MAX_STARS 20
+#define SP_MAX_BOSS_PROJECTILES 8
+#define SP_BOMBER_W 13
+#define SP_BOMBER_H 10
+#define DREADNAUGHT_W 28
+#define DREADNAUGHT_H 18
 
 // Player sprite (7x8) - forward-facing fighter plane
 const unsigned char spr_player[] PROGMEM = {
@@ -572,17 +577,18 @@ const uint8_t spr_fighter[6] PROGMEM = {
   0b00010000   // ...#...
 };
 
-// Bomber: 11x9, exact silhouette from the reference.
-const uint16_t spr_bomber[9] PROGMEM = {
-  0b00000100000, // .....#.....
-  0b00001110000, // ....###....
-  0b01111011110, // .####.####.
-  0b11111111111, // ###########
-  0b11111111111, // ###########
-  0b01101110110, // .##.###.##.
-  0b00001110000, // ....###....
-  0b00011111000, // ...#####...
-  0b00011111000  // ...#####...
+// Bomber: 13x10, exact pixel pattern from the user's latest reference image.
+const uint16_t spr_bomber[10] PROGMEM = {
+  0b0000001000000, // ......#......
+  0b0000011100000, // .....###.....
+  0b0010011100100, // ..#..###..#..
+  0b1111110111111, // ######.######
+  0b1111111111111, // #############
+  0b0111111111110, // .###########.
+  0b0011011101100, // ..##.###.##..
+  0b0000011100000, // .....###.....
+  0b0000111110000, // ....#####....
+  0b0000111110000  // ....#####....
 };
 
 // Scout: 9x9. This base orientation is the exact reference sprite.
@@ -598,6 +604,31 @@ const uint16_t spr_scout[9] PROGMEM = {
   0b000010000, // ....#....
   0b000111000, // ...###...
   0b001111100  // ..#####..
+};
+
+// Dreadnought boss: exact 28x18 top-left sprite selected from the user's reference sheet, facing upward.
+// Dreadnought boss: exact pixel pattern read from the user's top-left
+// reference sprite. The artwork itself is 25x16 pixels, centered inside
+// the saved 28x18 boss canvas. It faces upward exactly like the reference.
+const uint32_t spr_dreadnought[18] PROGMEM = {
+  0b0000000000000100000000000000,
+  0b0000000000001110000000000000,
+  0b0000000011001010011000000000,
+  0b0000100011001010011000100000,
+  0b0001111111111111111111110000,
+  0b0111111111111111111111111100,
+  0b0111111111111111111111111100,
+  0b0011111111111111111111111000,
+  0b0000011111111111111111000000,
+  0b0000000011111111111000000000,
+  0b0000000011001110011000000000,
+  0b0000000001000100010000000000,
+  0b0000000001000000010000000000,
+  0b0000000011111111111000000000,
+  0b0000000111111111111100000000,
+  0b0000000111111111111100000000,
+  0b0000000000000000000000000000,
+  0b0000000000000000000000000000
 };
 
 // --- Game Structures ---
@@ -630,6 +661,13 @@ struct Enemy {
   float straightRemaining;
   int spriteDir;       // 0 up, 1 right, 2 down, 3 left
   int circlesDone;
+};
+
+struct BossProjectile {
+  float x, y;
+  float dx, dy;
+  int type; // 0 = 4x4 aimed circle, 1 = normal 2x2 tri-shot
+  bool active;
 };
 
 struct PowerUp {
@@ -675,6 +713,21 @@ struct SkyPatrolGame {
   // Bomber/scout tracking
   int activeBombers;
   int scoutsSpawnedThisWave;
+  unsigned long lastScoutSpawn; // keeps scouts spaced apart within a wave
+
+  // Dreadnought boss
+  bool bossSpawned;
+  bool bossActive;
+  bool bossDefeated;
+  float bossX, bossY;
+  int bossHp;
+  float bossTargetX;
+  int bossPosition; // 0 = left, 1 = middle, 2 = right
+  int bossAttackType; // 0 = aimed 4x4 circle, 1 = tri-shot
+  int bossState; // 0 enter, 1 idle, 2 attack pause, 3 post-attack, 4 reposition
+  unsigned long bossStateTime;
+  unsigned long bossLastAttack;
+  unsigned long bossExplosionStart;
 
   // Game state
   bool gameOver;
@@ -691,6 +744,7 @@ struct SkyPatrolGame {
 
   Bullet bullets[SP_MAX_BULLETS];
   Bullet enemyBullets[SP_MAX_ENEMY_BULLETS];
+  BossProjectile bossProjectiles[SP_MAX_BOSS_PROJECTILES];
   Enemy enemies[SP_MAX_ENEMIES];
   PowerUp powerups[SP_MAX_POWERUPS];
   Explosion explosions[SP_MAX_EXPLOSIONS];
@@ -698,6 +752,67 @@ struct SkyPatrolGame {
 };
 
 SkyPatrolGame sp;
+
+// Select a Scout circle without changing its established radius or movement speed.
+// Uses primitive parameters so Arduino's automatic prototype generation never
+// needs to see the Enemy struct before it is declared.
+bool setSafeScoutCircle(float ex, float ey, float radius,
+                        float &circleStartAngle, float &circleAngle,
+                        float &circleCX, float &circleCY) {
+  const float spriteHalf = 4.5f;
+  const float minGap = 7.0f;
+  const float playerLeft = sp.playerX - minGap;
+  const float playerRight = sp.playerX + SP_PLAYER_W + minGap;
+  const float playerTop = SP_PLAYER_Y - minGap;
+  const float playerBottom = SP_PLAYER_Y + SP_PLAYER_H + minGap;
+
+  for (int attempt = 0; attempt < 24; attempt++) {
+    float angle = random(0, 628) / 100.0f;
+    float cx = ex - cos(angle) * radius;
+    float cy = ey - sin(angle) * radius;
+
+    // Check the full circle envelope so the Scout does not swing too close
+    // to the player at any point during this maneuver.
+    float left = cx - radius - spriteHalf;
+    float right = cx + radius + spriteHalf;
+    float top = cy - radius - spriteHalf;
+    float bottom = cy + radius + spriteHalf;
+
+    bool tooClose = (left <= playerRight && right >= playerLeft &&
+                     top <= playerBottom && bottom >= playerTop);
+    if (!tooClose) {
+      circleStartAngle = angle;
+      circleAngle = angle;
+      circleCX = cx;
+      circleCY = cy;
+      return true;
+    }
+  }
+
+  // Deterministic fallback: scan the circle around the current point.
+  for (int n = 0; n < 36; n++) {
+    float angle = (TWO_PI * n) / 36.0f;
+    float cx = ex - cos(angle) * radius;
+    float cy = ey - sin(angle) * radius;
+
+    float left = cx - radius - spriteHalf;
+    float right = cx + radius + spriteHalf;
+    float top = cy - radius - spriteHalf;
+    float bottom = cy + radius + spriteHalf;
+
+    bool tooClose = (left <= playerRight && right >= playerLeft &&
+                     top <= playerBottom && bottom >= playerTop);
+    if (!tooClose) {
+      circleStartAngle = angle;
+      circleAngle = angle;
+      circleCX = cx;
+      circleCY = cy;
+      return true;
+    }
+  }
+
+  return false;
+}
 
 void initSkyPatrol() {
   memset(&sp, 0, sizeof(sp));
@@ -717,6 +832,20 @@ void initSkyPatrol() {
   sp.bombCount = 0;
   sp.activeBombers = 0;
   sp.scoutsSpawnedThisWave = 0;
+  sp.lastScoutSpawn = 0;
+  sp.bossSpawned = false;
+  sp.bossActive = false;
+  sp.bossDefeated = false;
+  sp.bossHp = 64;
+  sp.bossX = SCREEN_WIDTH / 2.0f - DREADNAUGHT_W / 2.0f;
+  sp.bossY = -DREADNAUGHT_H - 2;
+  sp.bossTargetX = sp.bossX;
+  sp.bossPosition = 1;
+  sp.bossAttackType = 0;
+  sp.bossState = 0;
+  sp.bossStateTime = 0;
+  sp.bossLastAttack = 0;
+  sp.bossExplosionStart = 0;
 
   // Init stars
   for (int i = 0; i < SP_MAX_STARS; i++) {
@@ -768,16 +897,33 @@ void drawFighter(int x, int y) {
         display.drawPixel(x + col, y + row, SH110X_WHITE);
       }
     }
+    // The reference's left wing is 1x2 pixels wider; extend only the artwork.
+    // Collision/hitbox remains the original 7x6.
+    if (row == 2 || row == 3) {
+      display.drawPixel(x - 1, y + row, SH110X_WHITE);
+    }
   }
 }
 
 // --- Draw Bomber Enemy ---
 void drawBomber(int x, int y) {
-  // Exact 11x9 reference sprite.
-  for (int row = 0; row < 9; row++) {
+  // Exact 13x10 reference sprite from the latest image.
+  for (int row = 0; row < SP_BOMBER_H; row++) {
     uint16_t bits = pgm_read_word(&spr_bomber[row]);
-    for (int col = 0; col < 11; col++) {
-      if (bits & (1U << (10 - col))) {
+    for (int col = 0; col < SP_BOMBER_W; col++) {
+      if (bits & (1U << (SP_BOMBER_W - 1 - col))) {
+        display.drawPixel(x + col, y + row, SH110X_WHITE);
+      }
+    }
+  }
+}
+
+// --- Draw Dreadnought Boss ---
+void drawDreadnought(int x, int y) {
+  for (int row = 0; row < DREADNAUGHT_H; row++) {
+    uint32_t bits = pgm_read_dword(&spr_dreadnought[row]);
+    for (int col = 0; col < DREADNAUGHT_W; col++) {
+      if (bits & (1UL << (DREADNAUGHT_W - 1 - col))) {
         display.drawPixel(x + col, y + row, SH110X_WHITE);
       }
     }
@@ -842,6 +988,36 @@ void spawnEnemyBullet(float x, float y) {
   }
 }
 
+void spawnBossProjectile(float x, float y, float dx, float dy, int type) {
+  for (int i = 0; i < SP_MAX_BOSS_PROJECTILES; i++) {
+    if (!sp.bossProjectiles[i].active) {
+      sp.bossProjectiles[i] = {x, y, dx, dy, type, true};
+      return;
+    }
+  }
+}
+
+void fireDreadnoughtAttack() {
+  float cx = sp.bossX + DREADNAUGHT_W / 2.0f;
+  float cy = sp.bossY + DREADNAUGHT_H;
+  const float speed = 1.5f;
+  if (sp.bossAttackType == 0) {
+    float tx = sp.playerX + SP_PLAYER_W / 2.0f;
+    float ty = SP_PLAYER_Y + SP_PLAYER_H / 2.0f;
+    float vx = tx - cx;
+    float vy = ty - cy;
+    float len = sqrt(vx * vx + vy * vy);
+    if (len < 0.001f) len = 1.0f;
+    spawnBossProjectile(cx - 2, cy, (vx / len) * speed, (vy / len) * speed, 0);
+  } else {
+    spawnBossProjectile(cx - 1, cy, -0.55f, speed, 1);
+    spawnBossProjectile(cx - 1, cy, 0.0f, speed, 1);
+    spawnBossProjectile(cx - 1, cy, 0.55f, speed, 1);
+  }
+  sp.bossLastAttack = millis();
+  sp.bossAttackType = 1 - sp.bossAttackType;
+}
+
 void spawnExplosion(float x, float y) {
   for (int i = 0; i < SP_MAX_EXPLOSIONS; i++) {
     if (!sp.explosions[i].active) {
@@ -852,8 +1028,8 @@ void spawnExplosion(float x, float y) {
 }
 
 void spawnPowerUp(float x, float y) {
-  // Random chance to drop a power-up (25%)
-  if (random(0, 100) >= 25) return;
+  // Lowered drop rate for balance: 12%.
+  if (random(0, 100) >= 12) return;
   for (int i = 0; i < SP_MAX_POWERUPS; i++) {
     if (!sp.powerups[i].active) {
       sp.powerups[i].x = x;
@@ -871,11 +1047,19 @@ void spawnEnemy() {
       bool spawnBomber = false;
       bool spawnScout = false;
 
-      // Scouts appear from wave 3 onward, 1-4 per wave.
-      // Bombers remain rarer and tougher.
+      // Scouts appear from wave 3 onward, but are deliberately spaced out.
+      // Lower quotas keep a wave from becoming crowded with Scouts.
       int scoutQuota = 0;
-      if (sp.wave >= 3) scoutQuota = min(4, 1 + ((sp.wave - 3) / 2));
-      if (sp.wave >= 3 && sp.scoutsSpawnedThisWave < scoutQuota) {
+      if (sp.wave >= 3) {
+        if (sp.wave <= 5) scoutQuota = 1;
+        else if (sp.wave <= 8) scoutQuota = 1;
+        else if (sp.wave <= 12) scoutQuota = 2;
+        else if (sp.wave <= 16) scoutQuota = 2;
+        else scoutQuota = 3;
+      }
+      unsigned long nowForScout = millis();
+      bool scoutSpacingOK = (sp.lastScoutSpawn == 0) || (nowForScout - sp.lastScoutSpawn >= 5000UL);
+      if (sp.wave >= 3 && scoutSpacingOK && sp.scoutsSpawnedThisWave < scoutQuota) {
         // Guarantee the quota while still allowing the exact spawn order to vary.
         int remainingEnemies = sp.enemiesPerWave - sp.enemiesSpawned;
         int scoutsNeeded = scoutQuota - sp.scoutsSpawnedThisWave;
@@ -912,31 +1096,32 @@ void spawnEnemy() {
         sp.enemies[i].type = 2;
         sp.enemies[i].hp = 3;
         sp.enemies[i].x = fromLeft ? -9 : SCREEN_WIDTH;
-        sp.enemies[i].y = random(8, 43);
+        sp.enemies[i].y = random(14, 40);
         sp.enemies[i].dx = fromLeft ? 0.3 : -0.3;
         sp.enemies[i].dy = 0;
         sp.enemies[i].spriteDir = fromLeft ? 1 : 3;
         sp.enemies[i].movePhase = 0;
         sp.enemies[i].straightRemaining = random(12, 29);
-        sp.enemies[i].circleRadius = random(7, 11);
+        sp.enemies[i].circleRadius = random(6, 9);
         sp.enemies[i].circleCX = fromLeft ? random(18, 72) : random(56, 110);
-        // Allow some close passes, but never put the circle center directly on the player.
-        sp.enemies[i].circleCY = random(18, 49);
+        // Keep the complete 9x9 Scout comfortably above the player while still allowing close passes.
+        sp.enemies[i].circleCY = random(16, 36);
         sp.enemies[i].circleStartAngle = random(0, 628) / 100.0;
         sp.enemies[i].circleAngle = sp.enemies[i].circleStartAngle;
         sp.enemies[i].circlesDone = 0;
         sp.scoutsSpawnedThisWave++;
+        sp.lastScoutSpawn = now;
       } else if (spawnBomber) {
         sp.enemies[i].type = 1;
         sp.enemies[i].hp = 5;
         bool fromLeft = random(0, 2) == 0;
-        sp.enemies[i].x = fromLeft ? -11 : SCREEN_WIDTH;
+        sp.enemies[i].x = fromLeft ? -13 : SCREEN_WIDTH;
         sp.enemies[i].y = random(6, 32);
         // More exposed random idle target instead of hugging its entrance side.
         if (random(0, 100) < 65) {
-          sp.enemies[i].targetX = random(16, SCREEN_WIDTH - 27);
+          sp.enemies[i].targetX = random(16, SCREEN_WIDTH - 29);
         } else {
-          sp.enemies[i].targetX = fromLeft ? random(4, 22) : random(SCREEN_WIDTH - 28, SCREEN_WIDTH - 12);
+          sp.enemies[i].targetX = fromLeft ? random(4, 24) : random(SCREEN_WIDTH - 30, SCREEN_WIDTH - 13);
         }
         sp.enemies[i].targetY = random(8, 34); // safely above player
         sp.enemies[i].dx = fromLeft ? 0.3 : -0.3;
@@ -955,6 +1140,85 @@ void spawnEnemy() {
       sp.enemiesSpawned++;
       return;
     }
+  }
+}
+
+void spawnDreadnought() {
+  sp.bossSpawned = true;
+  sp.bossHp = 64;
+  sp.bossActive = true;
+  sp.bossDefeated = false;
+  sp.bossX = SCREEN_WIDTH / 2.0f - DREADNAUGHT_W / 2.0f;
+  sp.bossY = -DREADNAUGHT_H - 2;
+  sp.bossTargetX = sp.bossX;
+  sp.bossPosition = 1;
+  sp.bossAttackType = 0;
+  sp.bossState = 0;
+  sp.bossStateTime = millis();
+  sp.bossLastAttack = 0;
+  sp.bossExplosionStart = 0;
+  for (int i = 0; i < SP_MAX_BOSS_PROJECTILES; i++) sp.bossProjectiles[i].active = false;
+  playToneAsync(220, 250);
+}
+
+void chooseDreadnoughtPosition() {
+  int next = random(0, 3);
+  if (next == sp.bossPosition) next = (next + 1 + random(0, 2)) % 3;
+  sp.bossPosition = next;
+  if (next == 0) sp.bossTargetX = 10;
+  else if (next == 1) sp.bossTargetX = (SCREEN_WIDTH - DREADNAUGHT_W) / 2.0f;
+  else sp.bossTargetX = SCREEN_WIDTH - DREADNAUGHT_W - 10;
+  sp.bossState = 4;
+  sp.bossStateTime = millis();
+}
+
+void updateDreadnought() {
+  if (!sp.bossActive || sp.bossDefeated) return;
+  unsigned long now = millis();
+  const float speed = 0.60f;
+  if (sp.bossState == 0) {
+    sp.bossY += speed;
+    if (sp.bossY >= 12) { sp.bossY = 12; sp.bossState = 1; sp.bossStateTime = now; }
+    return;
+  }
+  if (sp.bossState == 4) {
+    float diff = sp.bossTargetX - sp.bossX;
+    if (fabs(diff) <= speed) { sp.bossX = sp.bossTargetX; sp.bossState = 1; sp.bossStateTime = now; }
+    else sp.bossX += (diff > 0 ? speed : -speed);
+    return;
+  }
+  if (sp.bossState == 1) {
+    float phase = (now / 1000.0f) * 0.9f;
+    sp.bossX = sp.bossTargetX + sin(phase) * 1.5f;
+    if (sp.bossX < 0) sp.bossX = 0;
+    if (sp.bossX > SCREEN_WIDTH - DREADNAUGHT_W) sp.bossX = SCREEN_WIDTH - DREADNAUGHT_W;
+    sp.bossY = 12 + cos(phase * 0.7f) * 0.7f;
+    if (now - sp.bossStateTime >= 900) { sp.bossState = 2; sp.bossStateTime = now; }
+    return;
+  }
+  if (sp.bossState == 2) {
+    if (now - sp.bossStateTime >= 180) { fireDreadnoughtAttack(); sp.bossState = 3; sp.bossStateTime = now; }
+    return;
+  }
+  if (sp.bossState == 3 && now - sp.bossStateTime >= 650) chooseDreadnoughtPosition();
+}
+
+void updateBossProjectiles() {
+  for (int i = 0; i < SP_MAX_BOSS_PROJECTILES; i++) {
+    if (!sp.bossProjectiles[i].active) continue;
+    sp.bossProjectiles[i].x += sp.bossProjectiles[i].dx;
+    sp.bossProjectiles[i].y += sp.bossProjectiles[i].dy;
+    int size = (sp.bossProjectiles[i].type == 0) ? 4 : 2;
+    if (sp.bossProjectiles[i].x < -size || sp.bossProjectiles[i].x > SCREEN_WIDTH || sp.bossProjectiles[i].y < -size || sp.bossProjectiles[i].y > SCREEN_HEIGHT) sp.bossProjectiles[i].active = false;
+  }
+}
+
+void updateBossDeathAnimation() {
+  if (!sp.bossDefeated) return;
+  if (millis() - sp.bossExplosionStart >= 1100) {
+    sp.bossActive = false;
+    sp.bossDefeated = false;
+    for (int i = 0; i < SP_MAX_BOSS_PROJECTILES; i++) sp.bossProjectiles[i].active = false;
   }
 }
 
@@ -978,36 +1242,8 @@ void handleSkyPatrolInput() {
     if (sp.playerX > SCREEN_WIDTH - SP_PLAYER_W) sp.playerX = SCREEN_WIDTH - SP_PLAYER_W;
   }
 
-  // Bomb: hold both Left+Right and press Enter.
-  // This takes priority over shooting so one Enter press cannot do both.
-  bool useBomb = btnLeft.pressed && btnRight.pressed &&
-                 btnEnter.justPressed && sp.bombCount > 0;
-
-  if (useBomb) {
-    sp.bombCount--;
-    // Destroy every enemy currently visible on the playfield.
-    // Enemies still off-screen remain alive and can enter later.
-    for (int i = 0; i < SP_MAX_ENEMIES; i++) {
-      if (!sp.enemies[i].active) continue;
-      int ew = (sp.enemies[i].type == 0) ? 7 : (sp.enemies[i].type == 1 ? 11 : 9);
-      int eh = (sp.enemies[i].type == 0) ? 6 : 9;
-      bool visible = (sp.enemies[i].x + ew > 0 && sp.enemies[i].x < SCREEN_WIDTH &&
-                      sp.enemies[i].y + eh > 0 && sp.enemies[i].y < SCREEN_HEIGHT);
-      if (visible) {
-        spawnExplosion(sp.enemies[i].x, sp.enemies[i].y);
-        sp.score += (sp.enemies[i].type == 1) ? 3 : (sp.enemies[i].type == 2 ? 2 : 1);
-        sp.enemiesKilledThisWave++;
-        if (sp.enemies[i].type == 1) sp.activeBombers--;
-        sp.enemies[i].active = false;
-      }
-    }
-    // Clear enemy bullets too
-    for (int i = 0; i < SP_MAX_ENEMY_BULLETS; i++) {
-      sp.enemyBullets[i].active = false;
-    }
-    playExplosion();
-    // Flash screen effect
-  } else if (btnEnter.justPressed) {
+  // Bomb power-ups activate automatically when collected; Enter only shoots.
+  if (btnEnter.justPressed) {
     // Fire: single press each shot
     unsigned long now = millis();
     if (now - sp.lastShot > 150) {
@@ -1053,6 +1289,10 @@ void updateSkyPatrol() {
     }
   }
 
+  // Update Dreadnought projectiles.
+  updateBossProjectiles();
+  updateBossDeathAnimation();
+
   // Update enemies
   for (int i = 0; i < SP_MAX_ENEMIES; i++) {
     if (!sp.enemies[i].active) continue;
@@ -1064,62 +1304,73 @@ void updateSkyPatrol() {
         sp.enemies[i].active = false;
       }
     } else if (sp.enemies[i].type == 1) {
-      // Bomber: enter from a side, then travel toward a random exposed idle position.
+      // Bomber: side entrance -> exposed idle position -> leave FORWARD/upward.
+      // The bomber sprite faces upward, so its forward exit direction is up.
       unsigned long age = now - sp.enemies[i].spawnTime;
-      if (age < 7000) {
-        // Move at the bomber's original slow speed until the chosen target is reached.
-        float tx = sp.enemies[i].targetX;
-        float ty = sp.enemies[i].targetY;
-        float vx = tx - sp.enemies[i].x;
-        float vy = ty - sp.enemies[i].y;
-        float dist = sqrt(vx * vx + vy * vy);
-        if (dist > 0.5) {
-          float step = 0.30;
-          sp.enemies[i].x += (vx / dist) * step;
-          sp.enemies[i].y += (vy / dist) * step;
+
+      if (age > 35000) {
+        // Exit phase has priority over all normal/idle movement.
+        // Stop shooting and fly straight upward until the whole sprite is off-screen.
+        sp.enemies[i].y -= 0.70f;
+        if (sp.enemies[i].y + SP_BOMBER_H < 0) {
+          sp.enemies[i].active = false;
+          if (sp.activeBombers > 0) sp.activeBombers--;
         }
       } else {
-        float phase = sp.enemies[i].idlePhase + (now / 1000.0);
-        sp.enemies[i].x += sin(phase) * 0.22;
-        sp.enemies[i].y += cos(phase * 0.7) * 0.08;
-        if (sp.enemies[i].x < 1) sp.enemies[i].x = 1;
-        if (sp.enemies[i].x > SCREEN_WIDTH - 12) sp.enemies[i].x = SCREEN_WIDTH - 12;
-        if (sp.enemies[i].y < 5) sp.enemies[i].y = 5;
-        if (sp.enemies[i].y > 38) sp.enemies[i].y = 38;
-      }
+        if (age < 7000) {
+          // Move toward the chosen exposed idle position.
+          float tx = sp.enemies[i].targetX;
+          float ty = sp.enemies[i].targetY;
+          float vx = tx - sp.enemies[i].x;
+          float vy = ty - sp.enemies[i].y;
+          float dist = sqrt(vx * vx + vy * vy);
+          if (dist > 0.5f) {
+            float step = 0.30f;
+            sp.enemies[i].x += (vx / dist) * step;
+            sp.enemies[i].y += (vy / dist) * step;
+          }
+        } else {
+          // Normal idle drift only before the leave phase.
+          float phase = sp.enemies[i].idlePhase + (now / 1000.0f);
+          sp.enemies[i].x += sin(phase) * 0.22f;
+          sp.enemies[i].y += cos(phase * 0.7f) * 0.08f;
+          if (sp.enemies[i].x < 1) sp.enemies[i].x = 1;
+          if (sp.enemies[i].x > SCREEN_WIDTH - SP_BOMBER_W - 1) sp.enemies[i].x = SCREEN_WIDTH - SP_BOMBER_W - 1;
+          if (sp.enemies[i].y < 5) sp.enemies[i].y = 5;
+          if (sp.enemies[i].y > 38) sp.enemies[i].y = 38;
+        }
 
-      // Bomber fires randomly every 2.5-4.5 seconds.
-      if (age > 1000 && (now - sp.enemies[i].lastShot) >= sp.enemies[i].shotInterval) {
-        sp.enemies[i].shotInterval = random(2500, 4501);
-        sp.enemies[i].lastShot = now;
-        spawnEnemyBullet(sp.enemies[i].x + 5, sp.enemies[i].y + 9);
-        playToneAsync(600, 30);
-      }
-
-      // Bomber eventually leaves upward.
-      if (age > 35000) {
-        sp.enemies[i].y -= 0.5;
-        if (sp.enemies[i].y < -12) {
-          sp.enemies[i].active = false;
-          sp.activeBombers--;
+        // Bomber fires only before it starts leaving.
+        if (age > 1000 && (now - sp.enemies[i].lastShot) >= sp.enemies[i].shotInterval) {
+          sp.enemies[i].shotInterval = random(2500, 4501);
+          sp.enemies[i].lastShot = now;
+          spawnEnemyBullet(sp.enemies[i].x + SP_BOMBER_W / 2,
+                           sp.enemies[i].y + SP_BOMBER_H);
+          playToneAsync(600, 30);
         }
       }
     } else {
       // Scout: horizontal entry -> one moderate circle -> horizontal pass -> another circle -> exit.
-      float speed = 0.30;
+      float speed = 0.36;
       int side = (sp.enemies[i].dx >= 0) ? 1 : -1;
       if (sp.enemies[i].movePhase == 0) {
         sp.enemies[i].x += sp.enemies[i].dx;
         sp.enemies[i].straightRemaining -= speed;
         sp.enemies[i].spriteDir = (side > 0) ? 1 : 3;
         if (sp.enemies[i].straightRemaining <= 0) {
-          // Start the circle exactly at the current position, so there is no teleport/jump.
-          sp.enemies[i].circleRadius = random(7, 11);
-          sp.enemies[i].circleStartAngle = random(0, 628) / 100.0;
-          sp.enemies[i].circleAngle = sp.enemies[i].circleStartAngle;
-          sp.enemies[i].circleCX = sp.enemies[i].x - cos(sp.enemies[i].circleAngle) * sp.enemies[i].circleRadius;
-          sp.enemies[i].circleCY = sp.enemies[i].y - sin(sp.enemies[i].circleAngle) * sp.enemies[i].circleRadius;
-          sp.enemies[i].movePhase = 1;
+          // Keep the exact current entry point and the existing radius.
+          // Only reject the circle if its full 9x9 sprite would come too close
+          // to the player; otherwise the Scout keeps its full vertical freedom.
+          sp.enemies[i].circleRadius = random(6, 9);
+          if (setSafeScoutCircle(sp.enemies[i].x, sp.enemies[i].y, sp.enemies[i].circleRadius,
+                                 sp.enemies[i].circleStartAngle, sp.enemies[i].circleAngle,
+                                 sp.enemies[i].circleCX, sp.enemies[i].circleCY)) {
+            sp.enemies[i].movePhase = 1;
+          } else {
+            // Stay on the normal horizontal path and try the circle again later.
+            sp.enemies[i].straightRemaining = 12;
+            sp.enemies[i].movePhase = 0;
+          }
         }
       } else if (sp.enemies[i].movePhase == 1 || sp.enemies[i].movePhase == 3) {
         float angleStep = speed / sp.enemies[i].circleRadius;
@@ -1148,13 +1399,19 @@ void updateSkyPatrol() {
         sp.enemies[i].straightRemaining -= speed;
         sp.enemies[i].spriteDir = (side > 0) ? 1 : 3;
         if (sp.enemies[i].straightRemaining <= 0) {
-          // Randomize the second circle while keeping the current point continuous.
-          sp.enemies[i].circleRadius = random(7, 11);
-          sp.enemies[i].circleStartAngle = random(0, 628) / 100.0;
-          sp.enemies[i].circleAngle = sp.enemies[i].circleStartAngle;
-          sp.enemies[i].circleCX = sp.enemies[i].x - cos(sp.enemies[i].circleAngle) * sp.enemies[i].circleRadius;
-          sp.enemies[i].circleCY = sp.enemies[i].y - sin(sp.enemies[i].circleAngle) * sp.enemies[i].circleRadius;
-          sp.enemies[i].movePhase = 3;
+          // Randomize the second circle while keeping the current point
+          // continuous. Do not change the established 6-8 px radius.
+          sp.enemies[i].circleRadius = random(6, 9);
+          if (setSafeScoutCircle(sp.enemies[i].x, sp.enemies[i].y, sp.enemies[i].circleRadius,
+                                 sp.enemies[i].circleStartAngle, sp.enemies[i].circleAngle,
+                                 sp.enemies[i].circleCX, sp.enemies[i].circleCY)) {
+            sp.enemies[i].movePhase = 3;
+          } else {
+            // If the player is occupying the only unsafe part of the path,
+            // keep moving horizontally and try again later.
+            sp.enemies[i].straightRemaining = 12;
+            sp.enemies[i].movePhase = 2;
+          }
         }
       } else if (sp.enemies[i].movePhase == 4) {
         sp.enemies[i].x += side * speed;
@@ -1197,8 +1454,8 @@ void updateSkyPatrol() {
     if (!sp.bullets[b].active) continue;
     for (int e = 0; e < SP_MAX_ENEMIES; e++) {
       if (!sp.enemies[e].active) continue;
-      int ew = (sp.enemies[e].type == 0) ? 7 : (sp.enemies[e].type == 1 ? 11 : 9);
-      int eh = (sp.enemies[e].type == 0) ? 6 : (sp.enemies[e].type == 1 ? 9 : 9);
+      int ew = (sp.enemies[e].type == 0) ? 7 : (sp.enemies[e].type == 1 ? SP_BOMBER_W : 9);
+      int eh = (sp.enemies[e].type == 0) ? 6 : (sp.enemies[e].type == 1 ? SP_BOMBER_H : 9);
       if (sp.bullets[b].x >= sp.enemies[e].x && sp.bullets[b].x <= sp.enemies[e].x + ew &&
           sp.bullets[b].y >= sp.enemies[e].y && sp.bullets[b].y <= sp.enemies[e].y + eh) {
         sp.bullets[b].active = false;
@@ -1223,8 +1480,8 @@ void updateSkyPatrol() {
   if (!sp.invincible && !sp.gameOver) {
     for (int e = 0; e < SP_MAX_ENEMIES; e++) {
       if (!sp.enemies[e].active) continue;
-      int ew = (sp.enemies[e].type == 0) ? 7 : (sp.enemies[e].type == 1 ? 11 : 9);
-      int eh = (sp.enemies[e].type == 0) ? 6 : (sp.enemies[e].type == 1 ? 9 : 9);
+      int ew = (sp.enemies[e].type == 0) ? 7 : (sp.enemies[e].type == 1 ? SP_BOMBER_W : 9);
+      int eh = (sp.enemies[e].type == 0) ? 6 : (sp.enemies[e].type == 1 ? SP_BOMBER_H : 9);
       // Simple AABB
       if (sp.playerX + SP_PLAYER_W > sp.enemies[e].x && sp.playerX < sp.enemies[e].x + ew &&
           SP_PLAYER_Y + SP_PLAYER_H > sp.enemies[e].y && SP_PLAYER_Y < sp.enemies[e].y + eh) {
@@ -1241,6 +1498,20 @@ void updateSkyPatrol() {
           playerDeath();
         }
       }
+    }
+  }
+
+  // --- Collision: Dreadnought body vs player ---
+  if (sp.bossActive && !sp.bossDefeated && !sp.invincible && !sp.gameOver) {
+    if (sp.playerX + SP_PLAYER_W > sp.bossX && sp.playerX < sp.bossX + DREADNAUGHT_W &&
+        SP_PLAYER_Y + SP_PLAYER_H > sp.bossY && SP_PLAYER_Y < sp.bossY + DREADNAUGHT_H) {
+      if (sp.shieldActive && millis() < sp.shieldEnd) {
+        sp.bossHp -= 3;
+        if (sp.bossHp <= 0) {
+          sp.bossHp = 0; sp.bossDefeated = true; sp.bossExplosionStart = millis(); sp.score += 15;
+        }
+        playHit();
+      } else playerDeath();
     }
   }
 
@@ -1276,12 +1547,73 @@ void updateSkyPatrol() {
           sp.triShotActive = true;
           sp.triShotEnd = now + 8000;
           break;
-        case 2: // Bomb
-          sp.bombCount++;
-          if (sp.bombCount > 3) sp.bombCount = 3;
+        case 2: // Bomb - automatic clear on collection
+          for (int e = 0; e < SP_MAX_ENEMIES; e++) {
+            if (!sp.enemies[e].active) continue;
+            int ew = (sp.enemies[e].type == 0) ? 7 : (sp.enemies[e].type == 1 ? SP_BOMBER_W : 9);
+            int eh = (sp.enemies[e].type == 0) ? 6 : (sp.enemies[e].type == 1 ? SP_BOMBER_H : 9);
+            bool visible = (sp.enemies[e].x + ew > 0 && sp.enemies[e].x < SCREEN_WIDTH &&
+                            sp.enemies[e].y + eh > 0 && sp.enemies[e].y < SCREEN_HEIGHT);
+            if (visible) {
+              spawnExplosion(sp.enemies[e].x, sp.enemies[e].y);
+              sp.score += (sp.enemies[e].type == 1) ? 3 : (sp.enemies[e].type == 2 ? 2 : 1);
+              sp.enemiesKilledThisWave++;
+              if (sp.enemies[e].type == 1) sp.activeBombers--;
+              sp.enemies[e].active = false;
+            }
+          }
+          sp.enemyBullets[0].active = false;
+          for (int b = 0; b < SP_MAX_ENEMY_BULLETS; b++) sp.enemyBullets[b].active = false;
+          if (sp.bossActive && !sp.bossDefeated &&
+              sp.bossX + DREADNAUGHT_W > 0 && sp.bossX < SCREEN_WIDTH &&
+              sp.bossY + DREADNAUGHT_H > 0 && sp.bossY < SCREEN_HEIGHT) {
+            sp.bossHp = 0;
+            sp.bossDefeated = true;
+            sp.bossExplosionStart = now;
+            sp.score += 15;
+          }
+          for (int b = 0; b < SP_MAX_BOSS_PROJECTILES; b++) sp.bossProjectiles[b].active = false;
+          playExplosion();
           break;
       }
       playPowerUp();
+    }
+  }
+
+  // --- Boss projectiles vs player ---
+  if (!sp.invincible && !sp.gameOver) {
+    for (int b = 0; b < SP_MAX_BOSS_PROJECTILES; b++) {
+      if (!sp.bossProjectiles[b].active) continue;
+      int sz = (sp.bossProjectiles[b].type == 0) ? 4 : 2;
+      if (sp.bossProjectiles[b].x + sz > sp.playerX && sp.bossProjectiles[b].x < sp.playerX + SP_PLAYER_W &&
+          sp.bossProjectiles[b].y + sz > SP_PLAYER_Y && sp.bossProjectiles[b].y < SP_PLAYER_Y + SP_PLAYER_H) {
+        sp.bossProjectiles[b].active = false;
+        if (sp.shieldActive && millis() < sp.shieldEnd) playToneAsync(1800, 20);
+        else playerDeath();
+      }
+    }
+  }
+
+  // --- Player bullets vs Dreadnought ---
+  if (sp.bossActive && !sp.bossDefeated) {
+    for (int b = 0; b < SP_MAX_BULLETS; b++) {
+      if (!sp.bullets[b].active) continue;
+      if (sp.bullets[b].x >= sp.bossX && sp.bullets[b].x <= sp.bossX + DREADNAUGHT_W &&
+          sp.bullets[b].y >= sp.bossY && sp.bullets[b].y <= sp.bossY + DREADNAUGHT_H) {
+        sp.bullets[b].active = false;
+        // 64-hit boss health.
+        int newHp = --sp.bossHp;
+        if (newHp <= 0) {
+          sp.bossDefeated = true;
+          sp.bossExplosionStart = millis();
+          sp.score += 15;
+          for (int p = 0; p < SP_MAX_BOSS_PROJECTILES; p++) sp.bossProjectiles[p].active = false;
+          playExplosion();
+        } else {
+          playToneAsync(1200, 15);
+        }
+        break;
+      }
     }
   }
 
@@ -1309,17 +1641,25 @@ void updateSkyPatrol() {
         sp.lastEnemySpawn = now;
       }
     } else {
-      // Check if wave is complete (all enemies spawned and killed/gone)
       bool anyActive = false;
       for (int i = 0; i < SP_MAX_ENEMIES; i++) {
         if (sp.enemies[i].active) { anyActive = true; break; }
       }
       if (!anyActive) {
-        // Next wave!
-        advanceWave();
+        if ((sp.wave % 15) == 0 && !sp.bossSpawned && !sp.bossActive) {
+          if (now >= sp.spawnUnlockTime) spawnDreadnought();
+        } else if ((sp.wave % 15) == 0 && sp.bossSpawned) {
+          if (!sp.bossActive && !sp.bossDefeated) advanceWave();
+        } else if ((sp.wave % 15) != 0) {
+          advanceWave();
+        }
       }
     }
   }
+
+  updateDreadnought();
+
+  // Boss collision and damage are processed below.
 }
 
 void playerDeath() {
@@ -1348,6 +1688,7 @@ void advanceWave() {
   sp.spawnUnlockTime = sp.waveStartTime + 1800; // give player time to react before new enemies appear
   sp.lastEnemySpawn = sp.waveStartTime;
   sp.scoutsSpawnedThisWave = 0;
+  sp.lastScoutSpawn = 0;
 
   // Increase enemies per wave with difficulty
   sp.enemiesPerWave = 5 + (sp.difficulty - 1) * 2;
@@ -1407,6 +1748,53 @@ void drawSkyPatrol() {
     }
   }
 
+  // Draw Dreadnought boss projectiles.
+  for (int i = 0; i < SP_MAX_BOSS_PROJECTILES; i++) {
+    if (!sp.bossProjectiles[i].active) continue;
+    int bx = (int)sp.bossProjectiles[i].x;
+    int by = (int)sp.bossProjectiles[i].y;
+    if (sp.bossProjectiles[i].type == 0) {
+      // Exact 4x4 circular pixel projectile:
+      // .##.
+      // ####
+      // ####
+      // .##.
+      display.fillRect(bx + 1, by, 2, 1, SH110X_WHITE);
+      display.fillRect(bx, by + 1, 4, 2, SH110X_WHITE);
+      display.fillRect(bx + 1, by + 3, 2, 1, SH110X_WHITE);
+    } else {
+      display.fillRect(bx, by, 2, 2, SH110X_WHITE);
+    }
+  }
+
+  // Draw Dreadnought.  Its HUD stays high at the very top so the full
+  // 28x18 sprite remains unobstructed.  The boss label is placed beside
+  // the player's lives.
+  if (sp.bossActive && !sp.bossDefeated) {
+    drawDreadnought((int)sp.bossX, (int)sp.bossY);
+    // Boss health bar only; the boss name is intentionally omitted.
+    display.drawRect(42, 0, 40, 4, SH110X_WHITE);
+    int hpWidth = (sp.bossHp * 36) / 64;
+    if (hpWidth > 0) display.fillRect(44, 1, hpWidth, 2, SH110X_WHITE);
+  }
+
+  // Dreadnought defeat animation: expanding circles followed by a large blast.
+  if (sp.bossDefeated) {
+    unsigned long age = millis() - sp.bossExplosionStart;
+    int cx = (int)(sp.bossX + DREADNAUGHT_W / 2);
+    int cy = (int)(sp.bossY + DREADNAUGHT_H / 2);
+    if (age < 500) {
+      int r1 = 2 + age / 90;
+      int r2 = 5 + age / 120;
+      display.drawCircle(cx, cy, r1, SH110X_WHITE);
+      display.drawCircle(cx, cy, r2, SH110X_WHITE);
+      if (age > 180) display.drawCircle(cx, cy, 10 + age / 70, SH110X_WHITE);
+    } else if (age < 1100) {
+      int r = 18 + (age - 500) / 20;
+      display.drawCircle(cx, cy, r, SH110X_WHITE);
+    }
+  }
+
   // Draw player bullets
   for (int i = 0; i < SP_MAX_BULLETS; i++) {
     if (sp.bullets[i].active) {
@@ -1463,11 +1851,6 @@ void drawSkyPatrol() {
     display.setCursor(37, 0);
     display.print("TR");
   }
-  if (sp.bombCount > 0) {
-    display.setCursor(100, 0);
-    display.print("B");
-    display.print(sp.bombCount);
-  }
 
   // Wave announcement
   unsigned long waveAge = millis() - sp.waveStartTime;
@@ -1480,15 +1863,16 @@ void drawSkyPatrol() {
 
   // Game Over screen
   if (sp.gameOver) {
-    display.fillRect(14, 18, 100, 30, SH110X_BLACK);
-    display.drawRect(14, 18, 100, 30, SH110X_WHITE);
+    // Taller box and separated text rows so the bottom border never overlaps the retry text.
+    display.fillRect(12, 14, 104, 38, SH110X_BLACK);
+    display.drawRect(12, 14, 104, 38, SH110X_WHITE);
     display.setTextSize(1);
-    display.setCursor(28, 22);
+    display.setCursor(34, 18);
     display.print("GAME OVER!");
-    display.setCursor(28, 34);
+    display.setCursor(28, 29);
     display.print("Score: ");
     display.print(sp.score);
-    display.setCursor(22, 44);
+    display.setCursor(24, 41);
     display.print("[ENTER] Retry");
   }
 
