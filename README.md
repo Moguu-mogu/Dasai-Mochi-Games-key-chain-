@@ -2,7 +2,7 @@
 
 A small **Dasai-Mochi-inspired desktop game console** built around an
 **ESP32-S3 SuperMini**, a 1.3-inch SH1106 OLED, physical buttons, a
-touch sensor, and a passive buzzer.
+touch sensor, a passive buzzer, and powered by 3.7V 1000mah LiPo Battery.
 
 The project combines an animated Mochi face with a separate game menu
 and a monochrome arcade shooter called **Sky Patrol**.
@@ -407,14 +407,9 @@ Planned or possible future improvements:
 
 -   [ ] Add more games
 -   [ ] Add a second/third game to the game menu
--   [ ] Expand the Dreadnought boss system
--   [ ] Add additional boss designs
--   [ ] Add more enemy types
 -   [ ] Add more pixel-art animations
--   [ ] Add persistent high scores
 -   [ ] Improve sound effects
--   [ ] Add more Mochi idle expressions
--   [ ] Improve power-up balancing
+-   [ ] Improve Mochi idle expression and features
 -   [ ] Add battery monitoring hardware/software if desired
 
 ------------------------------------------------------------------------
@@ -433,6 +428,8 @@ Built as a personal embedded-systems and programming project using:
 -   Custom pixel art
 -   C/C++ game logic
 
+note: This code support by AI and code from different programmer such as the
+Dasai-Mochi concept except games. This project is for personal uses only :).
 ------------------------------------------------------------------------
 
 # License
