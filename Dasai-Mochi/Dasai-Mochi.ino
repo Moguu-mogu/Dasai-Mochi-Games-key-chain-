@@ -1,3 +1,6 @@
+//SPDX-License-Identifier: MIT
+//Copyright (c) 2026 Moogu-mogu - see LICENSE
+
 // ==================================================
 // DASAI MOCHI - MULTI-FEATURE GAME CONSOLE
 // Board: ESP32-S3 SuperMini
